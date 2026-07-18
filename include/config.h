@@ -5,12 +5,12 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ── Wi-Fi ────────────────────────────────────────────────────────────────────
-#define WIFI_SSID       "your-ssid"
-#define WIFI_PASS       "your-password"
+#define WIFI_SSID       "wifi-name"
+#define WIFI_PASS       "wifi-password"
 
 // ── Supernova voice server ───────────────────────────────────────────────────
-#define SERVER_HOST     "192.168.8.200"   // same host/port as voice_server in config.yaml
-#define SERVER_PORT     8765
+#define SERVER_HOST     "name_of_supernova_server.lan"   // same host/port as voice_server in config.yaml
+#define SERVER_PORT     10400
 
 // ── Identity (mirrors the Pi client's HELO registration) ─────────────────────
 // endpoint_id: stable identifier for this satellite, used by the server
@@ -26,7 +26,7 @@
 
 // Speaker output scale. The NS4168 distorts near full scale on the tiny
 // driver, so leave some headroom.
-#define SPK_VOLUME      0.70f   // 0.0–1.0
+#define SPK_VOLUME      1.0f   // 0.0–1.0
 
 // ── Button ───────────────────────────────────────────────────────────────────
 // Press while IDLE  → WAKE (the wake-word replacement)
@@ -45,4 +45,4 @@
 #define SESSION_TIMEOUT_MS  60000   // matches the Pi client's 60s event timeout
 
 // ── LED ──────────────────────────────────────────────────────────────────────
-#define LED_BRIGHTNESS  40      // 0–255; the SK6812 is very bright
+#define LED_BRIGHTNESS  60      // 0–255; the SK6812 is very bright
