@@ -31,25 +31,27 @@ struct WifiProfile {
 // ── Multi-Wi-Fi Profile Registry ─────────────────────────────────────────────
 // The system scans and targets the strongest profile available automatically.
 const WifiProfile TAILORED_NETWORKS[] = {
-    {"home-wifi",       "homepassword",   LOCATION_LOCAL},
-    {"Work-WiFi-SSID",  "workpassword",   LOCATION_REMOTE}
+    {"home-wifi", "password", LOCATION_LOCAL},
+    {"work-wifi", "password", LOCATION_REMOTE},
+    {"mobile-wifi", "password", LOCATION_REMOTE}
 };
 const size_t NETWORKS_COUNT = sizeof(TAILORED_NETWORKS) / sizeof(TAILORED_NETWORKS[0]);
 
 // ── WireGuard VPN Credentials ────────────────────────────────────────────────
 // Extracted from your home DietPi deployment client profiles
 namespace WireGuardConfig {
-    const char PRIVATE_KEY[]     = "YOUR_M5ATOM_PRIVATE_KEY_HERE=";
-    const char INTERNAL_IP[]    = "10.9.0.3";                        // Unique client VPN IP
-    const char SERVER_PUB_KEY[]  = "YOUR_DIETPI_SERVER_PUBLIC_KEY=";     // Server verification key
-    const char PUBLIC_ENDPOINT[] = "yourdns.duckdns.org";            // Home public IP or DDNS
+    const char PRIVATE_KEY[]     = "private_key";
+    const char INTERNAL_IP[]     = "10.22.245.4";                        // Unique client VPN IP
+    const char SERVER_PUB_KEY[]  = "public_key";     // Server verification key
+    const char PUBLIC_ENDPOINT[] = "home_public_ip";            // Home public IP or DDNS
     const int  UDP_PORT          = 51820;                            // Forwarded UDP port
+    const char LAN_SUBNET[]      = "192.168.8.0/24";          // set this so that the wireguard client knows to route remote LAN traffic through
 }
 
 // ── Dynamic Server Core Connections ──────────────────────────────────────────
 namespace AgentConfig {
-    const char LOCAL_IP[]   = "IP_of_agent";  // Target address when directly at home
-    const char TUNNEL_IP[]  = "IP_of_agent";    // Target address (DietPi server IP) inside VPN tunnel
+    const char LOCAL_IP[]   = "jetson.lan";  // Target address when directly at home
+    const char TUNNEL_IP[]  = "192.168.8.200";    // Target address (DietPi server IP) inside VPN tunnel
     const int  SERVER_PORT  = 10400;
 }
 

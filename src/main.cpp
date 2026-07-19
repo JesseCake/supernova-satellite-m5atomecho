@@ -8,6 +8,7 @@
 #include <WiFi.h>
 #include <WiFiMulti.h>
 #include <WireGuard-ESP32.h>
+#include <ESP32Ping.h>
 #include <FastLED.h>
 #include <driver/i2s.h>
 #include <time.h>
@@ -259,17 +260,39 @@ static void ensureWifi() {
   else {
     Serial.println("[network] Remote interface active. Building WireGuard secure pipeline...");
     syncTimeWithTimezone();
-    
+
+    IPAddress localIP;
+    localIP.fromString(WireGuardConfig::INTERNAL_IP);
+
+    // FIXED: Only declare the boolean once here
     bool wgConnected = wg.begin(
-      IPAddress().fromString(WireGuardConfig::INTERNAL_IP),
+      localIP,
       WireGuardConfig::PRIVATE_KEY,
       WireGuardConfig::PUBLIC_ENDPOINT,
       WireGuardConfig::SERVER_PUB_KEY,
       WireGuardConfig::UDP_PORT
     );
-    
+
     if (wgConnected) {
-      Serial.println("[network] WireGuard handshake operational.");
+      Serial.println("[network] WireGuard interface initialized. Running diagnostics...");
+      delay(1000); // Give the network stack a moment to settle
+      
+      // 1. Diagnostics: Try pinging the WireGuard Server Gateway
+      Serial.print("[ping] Testing tunnel gateway (10.22.245.1)... ");
+      if (Ping.ping("10.22.245.1", 3)) {
+        Serial.printf("SUCCESS! Avg time: %d ms\n", Ping.averageTime());
+      } else {
+        Serial.println("FAILED. Server tunnel interface is unreachable.");
+      }
+
+      // 2. Diagnostics: Try pinging the voice engine machine on the home LAN
+      Serial.printf("[ping] Testing voice engine host (%s)... ", AgentConfig::TUNNEL_IP);
+      if (Ping.ping(AgentConfig::TUNNEL_IP, 3)) {
+        Serial.printf("SUCCESS! Avg time: %d ms\n", Ping.averageTime());
+      } else {
+        Serial.println("FAILED. Host is unreachable over the tunnel path.");
+      }
+
       activeServerHost = AgentConfig::TUNNEL_IP;
     } else {
       Serial.println("[network] CRITICAL ERROR: WireGuard configuration pipeline failure.");
@@ -618,10 +641,12 @@ void loop() {
                   reconnectDelay / 1000.0f);
     uint32_t until = millis() + (uint32_t)reconnectDelay;
     while (millis() < until) { ledUpdate(); delay(50); }
-    reconnectDelay = min(reconnectDelay * 2, 60000.0f);
+    
+    // AGGRESSIVE RECONNECT: Cap the backoff at 5 seconds (5000ms)
+    reconnectDelay = min(reconnectDelay * 1.5f, 5000.0f); 
     return;
   }
-  reconnectDelay = 2000.0f;           
+  reconnectDelay = 2000.0f; // Reset on successful connection
 
   runConnection();
 
@@ -629,5 +654,7 @@ void loop() {
                 reconnectDelay / 1000.0f);
   uint32_t until = millis() + (uint32_t)reconnectDelay;
   while (millis() < until) { ledUpdate(); delay(50); }
-  reconnectDelay = min(reconnectDelay * 2, 60000.0f);
+  
+  // AGGRESSIVE RECONNECT: Apply the same 5-second cap here for drops mid-session
+  reconnectDelay = min(reconnectDelay * 1.5f, 5000.0f); 
 }
