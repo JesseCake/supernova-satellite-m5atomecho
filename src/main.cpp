@@ -1,55 +1,16 @@
 /*
- * Supernova satellite — M5 Atom Echo firmware
+ * Supernova satellite — M5 Atom Echo firmware (With WireGuard Roaming Expansion)
  * ─────────────────────────────────────────────────────────────────────────────
- * C++/PlatformIO port of satellite_client.py for the M5 Atom Echo
- * (ESP32-PICO-D4, PDM mic, I2S speaker, one button, one SK6812 LED).
- *
- * Protocol (same as the Pi client, plus one new frame):
- *
- *   Client → Server:
- *     HELO  JSON {"id": ..., "name": ...}  once per (re)connect
- *     WAKE  optional payload = CALL announcement text being echoed back
- *     MIC1  no payload — marks start of fresh listening window
- *     AUD0  int16 mono 16 kHz PCM chunk
- *     BYE0  no payload — user hang-up (NEW; server should end the session
- *           and reply CLOS, exactly like its normal session-end path)
- *
- *   Server → Client:
- *     RDY0  ready for audio
- *     TTS0  int16 mono 16 kHz PCM (streamed to I2S, never fully buffered)
- *     BEEP  int16 mono 16 kHz PCM
- *     THNK  server thinking
- *     CLOS  session over, connection persists
- *     CALL  server-initiated session, optional announcement text payload
- *
- * Button — straight swap for the wake word, plus hang-up:
- *     press while IDLE       → send WAKE (start a session)
- *     press during a session → send BYE0 (hang up). Playback is cut
- *                              immediately; further TTS0 is discarded until
- *                              CLOS arrives. If the server doesn't answer
- *                              with CLOS within HANGUP_FALLBACK_MS (e.g. the
- *                              BYE0 handler isn't implemented yet), the
- *                              satellite force-closes the session locally.
- *
- * Differences from the Pi client, forced by hardware:
- *   • No wake word — the button plays the role of the "_WAKE" event.
- *   • Audio payloads are streamed from the socket in 2 KB chunks directly
- *     into the I2S DMA (no PSRAM; a single utterance wouldn't fit in heap).
- *   • Mic and speaker share GPIO33, so the I2S driver is reinstalled when
- *     switching direction. The protocol is half-duplex anyway, so this is
- *     invisible at the session level.
- *
- * LED legend:
- *   blinking yellow  Wi-Fi connecting     dim white   IDLE (connected)
- *   blinking red     reconnect backoff    yellow      WAITING
- *   blue             LISTENING            pulsing purple  THINKING
- *   green            SPEAKING             orange      CLOSING / hanging up
+ * Protocol remains half-duplex, running matching frame architectures.
  */
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiMulti.h>
+#include <WireGuard-ESP32.h>
 #include <FastLED.h>
 #include <driver/i2s.h>
+#include <time.h>
 #include "config.h"
 
 // ── Pins (fixed by the Atom Echo board) ──────────────────────────────────────
@@ -68,12 +29,12 @@ static const size_t   STREAM_CHUNK = 2048;   // bytes per TTS0 socket read
 // ── Frame protocol: 4-byte tag + uint32 LE length ────────────────────────────
 struct FrameHeader {
   char     tag[4];
-  uint32_t length;      // little-endian on the wire; ESP32 is LE, so memcpy ok
+  uint32_t length;      
 } __attribute__((packed));
 
 static bool tagIs(const char t[4], const char *s) { return memcmp(t, s, 4) == 0; }
 
-// ── State machine (mirrors satellite_client.State) ───────────────────────────
+// ── State machine ───────────────────────────────────────────────────────────
 enum class State { IDLE, WAITING, LISTENING, THINKING, SPEAKING, CLOSING };
 static const char *stateName(State s) {
   switch (s) {
@@ -88,18 +49,24 @@ static const char *stateName(State s) {
 }
 
 // ── Globals ──────────────────────────────────────────────────────────────────
-static WiFiClient client;
-static State      state          = State::IDLE;
-static bool       micStreaming   = false;   // AUD0 frames flowing
-static bool       sessionActive  = false;
-static bool       hangingUp      = false;   // BYE0 sent, waiting for CLOS
-static bool       discardTTS     = false;   // swallow TTS0 until CLOS
-static uint32_t   hangupSentMs   = 0;
-static uint32_t   lastEventMs    = 0;
-static uint32_t   lastSessionEnd = 0;       // for WAKE_COOLDOWN_MS
-static float      reconnectDelay = 2000.0f; // exponential backoff, ms
+static WiFiClient  client;
+static WiFiMulti   wifiMulti;
+static WireGuard   wg;
+static State       state          = State::IDLE;
+static bool        micStreaming   = false;   
+static bool        sessionActive  = false;
+static bool        hangingUp      = false;   
+static bool        discardTTS     = false;   
+static uint32_t    hangupSentMs   = 0;
+static uint32_t    lastEventMs    = 0;
+static uint32_t    lastSessionEnd = 0;       
+static float       reconnectDelay = 2000.0f; 
 
-// Pending WAKE payload (CALL announcement echo, like _pending_call_payload)
+static String      activeServerHost  = "";
+static int         activeServerPort  = AgentConfig::SERVER_PORT;
+static String      lastConnectedSSID = "";
+
+// Pending WAKE payload
 static char   pendingCallPayload[256];
 static size_t pendingCallLen = 0;
 
@@ -108,7 +75,6 @@ static CRGB led[1];
 // ═════════════════════════════════════════════════════════════════════════════
 // LED
 // ═════════════════════════════════════════════════════════════════════════════
-
 static void ledShow(CRGB c) { led[0] = c; FastLED.show(); }
 
 static void ledUpdate() {
@@ -120,7 +86,7 @@ static void ledUpdate() {
     case State::WAITING:   ledShow(CRGB::Yellow);     break;
     case State::LISTENING: ledShow(CRGB::Blue);       break;
     case State::THINKING: {
-      uint8_t v = beatsin8(45, 20, 255);              // gentle pulse
+      uint8_t v = beatsin8(45, 20, 255);              
       ledShow(CRGB(v / 2, 0, v));
       break;
     }
@@ -130,9 +96,8 @@ static void ledUpdate() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// I2S — half-duplex, reinstalled on direction change (GPIO33 is shared)
+// I2S — half-duplex management
 // ═════════════════════════════════════════════════════════════════════════════
-
 enum class I2SMode { NONE, SPEAKER, MIC };
 static I2SMode i2sMode = I2SMode::NONE;
 
@@ -176,19 +141,16 @@ static void spkWrite(const int16_t *samples, size_t n) {
   i2s_write(I2S_NUM_0, samples, n * sizeof(int16_t), &written, portMAX_DELAY);
 }
 
-// Scale a PCM buffer in place by SPK_VOLUME.
 static void applyVolume(int16_t *samples, size_t n) {
   for (size_t i = 0; i < n; i++)
     samples[i] = (int16_t)((int32_t)(samples[i] * SPK_VOLUME));
 }
 
-// Rough wait for the I2S TX DMA to drain (dma_buf_count * dma_buf_len samples).
 static void spkDrain() { delay((8 * 256 * 1000) / SAMPLE_RATE + 20); }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Local sounds (ports of AudioIO.beep / inbound_alert)
+// Local sounds 
 // ═════════════════════════════════════════════════════════════════════════════
-
 static void beep(float freq, float duration, float volume) {
   i2sSetMode(I2SMode::SPEAKER);
   const size_t total = (size_t)(SAMPLE_RATE * duration);
@@ -200,7 +162,6 @@ static void beep(float freq, float duration, float volume) {
     for (size_t i = 0; i < n; i++) {
       size_t idx = done + i;
       float  v   = sinf(2.0f * PI * freq * idx / SAMPLE_RATE) * volume;
-      // 4 ms fade in/out to avoid clicks
       if (idx < fade)          v *= (float)idx / fade;
       if (idx > total - fade)  v *= (float)(total - idx) / fade;
       buf[i] = (int16_t)(constrain(v, -1.0f, 1.0f) * 32767.0f);
@@ -221,8 +182,6 @@ static void playSilence(float duration) {
   }
 }
 
-// XDR/SDR cassette tone ladder — the server-initiated CALL alert,
-// ported verbatim from AudioIO.inbound_alert().
 static void inboundAlert(int repeats = 2) {
   static const float freqs[] = {50, 100, 250, 400, 640, 1010, 1610, 4000, 6350, 8100};
   const int   nFreqs   = sizeof(freqs) / sizeof(freqs[0]);
@@ -245,20 +204,89 @@ static void closingBeeps() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Networking primitives
+// Networking & Environment Switching
 // ═════════════════════════════════════════════════════════════════════════════
+static const WifiProfile* findCurrentProfile(String connectedSSID) {
+  for (size_t i = 0; i < NETWORKS_COUNT; i++) {
+    if (connectedSSID == TAILORED_NETWORKS[i].ssid) {
+      return &TAILORED_NETWORKS[i];
+    }
+  }
+  return nullptr;
+}
+
+static void syncTimeWithTimezone() {
+  Serial.println("[time] Synchronizing network time via NTP...");
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  setenv("TZ", TZ_RULE, 1);
+  tzset();
+  
+  struct tm timeinfo;
+  int retry = 0;
+  while (!getLocalTime(&timeinfo) && retry < 10) {
+    Serial.print(".");
+    delay(500);
+    retry++;
+  }
+  Serial.println("\n[time] Core time synchronization completed.");
+}
+
+static void ensureWifi() {
+  if (WiFi.status() == WL_CONNECTED && WiFi.SSID() == lastConnectedSSID) return;
+  
+  Serial.println("[wifi] Link down or network transition detected.");
+  WiFi.mode(WIFI_STA);
+  
+  for (size_t i = 0; i < NETWORKS_COUNT; i++) {
+    wifiMulti.addAP(TAILORED_NETWORKS[i].ssid, TAILORED_NETWORKS[i].password);
+  }
+  
+  while (wifiMulti.run() != WL_CONNECTED) {
+    ledShow((millis() / 300) % 2 ? CRGB::Yellow : CRGB::Black);
+    delay(100);
+  }
+  
+  String currentSSID = WiFi.SSID();
+  lastConnectedSSID = currentSSID;
+  Serial.printf("[wifi] Logged into %s, Local Device IP: %s\n", currentSSID.c_str(), WiFi.localIP().toString().c_str());
+  
+  const WifiProfile* activeProfile = findCurrentProfile(currentSSID);
+  
+  if (activeProfile != nullptr && activeProfile->locationType == LOCATION_LOCAL) {
+    Serial.println("[network] Local interface active. Interfacing server over raw LAN.");
+    activeServerHost = AgentConfig::LOCAL_IP;
+  } 
+  else {
+    Serial.println("[network] Remote interface active. Building WireGuard secure pipeline...");
+    syncTimeWithTimezone();
+    
+    bool wgConnected = wg.begin(
+      IPAddress().fromString(WireGuardConfig::INTERNAL_IP),
+      WireGuardConfig::PRIVATE_KEY,
+      WireGuardConfig::PUBLIC_ENDPOINT,
+      WireGuardConfig::SERVER_PUB_KEY,
+      WireGuardConfig::UDP_PORT
+    );
+    
+    if (wgConnected) {
+      Serial.println("[network] WireGuard handshake operational.");
+      activeServerHost = AgentConfig::TUNNEL_IP;
+    } else {
+      Serial.println("[network] CRITICAL ERROR: WireGuard configuration pipeline failure.");
+    }
+  }
+}
 
 static bool sendFrame(const char *tag, const uint8_t *payload = nullptr, uint32_t len = 0) {
   if (!client.connected()) return false;
   FrameHeader hdr;
   memcpy(hdr.tag, tag, 4);
-  hdr.length = len;                       // ESP32 is little-endian, matches "<4sI"
+  hdr.length = len;                       
   if (client.write((uint8_t *)&hdr, sizeof(hdr)) != sizeof(hdr)) return false;
   if (len && client.write(payload, len) != len) return false;
   return true;
 }
 
-// Blocking read with deadline. Returns false on timeout/disconnect.
 static bool readExactly(uint8_t *dst, size_t n, uint32_t timeoutMs = 10000) {
   uint32_t deadline = millis() + timeoutMs;
   size_t   got      = 0;
@@ -276,9 +304,8 @@ static bool readExactly(uint8_t *dst, size_t n, uint32_t timeoutMs = 10000) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Button — debounced press detection (the wake-word stand-in)
+// Button — debounced press detection
 // ═════════════════════════════════════════════════════════════════════════════
-
 static bool buttonPressed() {
   static bool     wasDown      = false;
   static uint32_t lastChangeMs = 0;
@@ -290,15 +317,14 @@ static bool buttonPressed() {
   if (down != wasDown) {
     wasDown      = down;
     lastChangeMs = now;
-    if (down) return true;      // fire on press, not release — feels snappier
+    if (down) return true;      
   }
   return false;
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// State transitions (mirrors _set_state / _on_state_enter)
+// State transitions
 // ═════════════════════════════════════════════════════════════════════════════
-
 static void setState(State s) {
   if (s == state) return;
   Serial.printf("[state] %s -> %s\n", stateName(state), stateName(s));
@@ -306,32 +332,15 @@ static void setState(State s) {
   ledUpdate();
 
   switch (s) {
-    case State::IDLE:
-      micStreaming = false;
-      break;
-
-    case State::WAITING:
-      micStreaming = false;
-      beep(1000, 0.08f, 0.3f);
-      break;
-
-    case State::LISTENING:
-      // handled by enterListening() (needs beep-before-mic-switch ordering)
-      break;
-
+    case State::IDLE:      micStreaming = false; break;
+    case State::WAITING:   micStreaming = false; beep(1000, 0.08f, 0.3f); break;
+    case State::LISTENING: break;
     case State::THINKING:
       micStreaming = false;
-      // 150 ms of silence primes the amp out of idle so the beep isn't
-      // clipped — same trick as the Pi client, and the NS4168 also swallows
-      // the first few ms after the I2S driver is (re)installed.
       playSilence(0.15f);
       beep(1000, 0.12f, 0.3f);
       break;
-
-    case State::SPEAKING:
-      micStreaming = false;
-      break;
-
+    case State::SPEAKING:  micStreaming = false; break;
     case State::CLOSING:
       micStreaming = false;
       spkDrain();
@@ -341,10 +350,9 @@ static void setState(State s) {
 }
 
 static void enterListening() {
-  beep(700, 0.12f, 0.3f);       // speaker mode
+  beep(700, 0.12f, 0.3f);       
   spkDrain();
   i2sSetMode(I2SMode::MIC);
-  // Flush a few reads — equivalent of audio.flush_input(CHUNK, 4)
   static int16_t junk[MIC_CHUNK];
   size_t br;
   for (int i = 0; i < 4; i++)
@@ -370,12 +378,10 @@ static void endSessionToIdle() {
   pendingCallLen = 0;
   lastSessionEnd = millis();
   setState(State::IDLE);
-  i2sSetMode(I2SMode::SPEAKER);   // ready for instant beeps / greetings
+  i2sSetMode(I2SMode::SPEAKER);   
   Serial.println("[satellite] IDLE - press button to start a session");
 }
 
-// Hang up: cut audio, send BYE0, then wait for the server's CLOS.
-// Called from the main loop and from mid-frame inside streamAudioPayload.
 static void hangUp() {
   if (!sessionActive || hangingUp) return;
   Serial.println("[button] hang up -> BYE0");
@@ -389,9 +395,8 @@ static void hangUp() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Mic pump — one AUD0 chunk per call (cooperative, keeps loop responsive)
+// Mic pump
 // ═════════════════════════════════════════════════════════════════════════════
-
 static void pumpMic() {
   static int16_t buf[MIC_CHUNK];
   size_t bytesRead = 0;
@@ -399,7 +404,6 @@ static void pumpMic() {
       || bytesRead == 0) return;
 
   size_t n = bytesRead / sizeof(int16_t);
-  // Fixed digital gain with clipping (SPM1423 is quiet)
   for (size_t i = 0; i < n; i++) {
     int32_t v = (int32_t)(buf[i] * MIC_GAIN);
     buf[i] = (int16_t)constrain(v, -32768, 32767);
@@ -409,12 +413,8 @@ static void pumpMic() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Incoming audio streaming (TTS0 / BEEP payloads)
+// Incoming audio streaming
 // ═════════════════════════════════════════════════════════════════════════════
-
-// Reads `length` bytes of PCM from the socket in chunks, feeding I2S directly.
-// The button is polled between chunks so a hang-up cuts playback mid-frame:
-// we keep consuming bytes (to stay frame-aligned) but stop writing them.
 static bool streamAudioPayload(uint32_t length) {
   static uint8_t buf[STREAM_CHUNK];
 
@@ -426,7 +426,6 @@ static bool streamAudioPayload(uint32_t length) {
   uint32_t remaining = length;
   while (remaining) {
     uint32_t n = min((uint32_t)STREAM_CHUNK, remaining);
-    // ~1 s of audio should never take >15 s to arrive; generous timeout
     if (!readExactly(buf, n, 15000)) return false;
     remaining -= n;
 
@@ -435,7 +434,7 @@ static bool streamAudioPayload(uint32_t length) {
       applyVolume((int16_t *)buf, samples);
       spkWrite((int16_t *)buf, samples);
 
-      if (buttonPressed() && sessionActive) hangUp();   // sets discardTTS
+      if (buttonPressed() && sessionActive) hangUp();   
     }
     ledUpdate();
   }
@@ -443,11 +442,8 @@ static bool streamAudioPayload(uint32_t length) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Frame dispatch — the merged IDLE-phase + session-phase logic of
-// _run_connection(), driven one frame at a time.
+// Frame dispatch
 // ═════════════════════════════════════════════════════════════════════════════
-
-// Skip a payload we don't care about without buffering it.
 static bool skipPayload(uint32_t length) {
   static uint8_t buf[256];
   while (length) {
@@ -458,7 +454,6 @@ static bool skipPayload(uint32_t length) {
   return true;
 }
 
-// Returns false on socket death.
 static bool pumpSocket() {
   if (client.available() < (int)sizeof(FrameHeader)) return client.connected();
 
@@ -466,25 +461,19 @@ static bool pumpSocket() {
   if (!readExactly((uint8_t *)&hdr, sizeof(hdr))) return false;
   lastEventMs = millis();
 
-  // ── Audio frames: streamed, never buffered ─────────────────────────────────
   if (tagIs(hdr.tag, "TTS0") || tagIs(hdr.tag, "BEEP")) {
     return streamAudioPayload(hdr.length);
   }
 
-  // ── Small control frames ───────────────────────────────────────────────────
   if (tagIs(hdr.tag, "RDY0")) {
     if (hdr.length && !skipPayload(hdr.length)) return false;
     if (hangingUp) {
-      // Server re-opened the mic mid-hangup (race with our BYE0) — ignore;
-      // the CLOS or our fallback timer will finish the job.
       Serial.println("[recv] RDY0 ignored (hanging up)");
       return true;
     }
     Serial.println("[recv] RDY0");
-    spkDrain();                       // let greeting/TTS finish before mic
+    spkDrain();                       
     if (!sessionActive) {
-      // Server greeted us while IDLE then sent RDY0 — the
-      // "channel_already_open" path: enter the session without sending WAKE.
       sessionActive = true;
       hangingUp     = false;
       discardTTS    = false;
@@ -495,7 +484,7 @@ static bool pumpSocket() {
 
   if (tagIs(hdr.tag, "THNK")) {
     if (hdr.length && !skipPayload(hdr.length)) return false;
-    if (hangingUp) return true;       // no thinking beep while hanging up
+    if (hangingUp) return true;       
     if (state != State::THINKING) {
       Serial.println("[recv] THNK");
       setState(State::THINKING);
@@ -506,15 +495,13 @@ static bool pumpSocket() {
   if (tagIs(hdr.tag, "CLOS")) {
     if (hdr.length && !skipPayload(hdr.length)) return false;
     Serial.println("[recv] CLOS - session ended, connection persists");
-    discardTTS = false;               // let CLOSING's drain+beeps behave normally
+    discardTTS = false;               
     setState(State::CLOSING);
     endSessionToIdle();
     return true;
   }
 
   if (tagIs(hdr.tag, "CALL")) {
-    // Server-initiated session. Payload = optional announcement text,
-    // echoed back in the WAKE frame (like _pending_call_payload).
     pendingCallLen = min((size_t)hdr.length, sizeof(pendingCallPayload));
     if (pendingCallLen && !readExactly((uint8_t *)pendingCallPayload, pendingCallLen))
       return false;
@@ -532,21 +519,16 @@ static bool pumpSocket() {
     return true;
   }
 
-  // Unknown frame — log and skip payload to stay aligned.
   Serial.printf("[recv] Unknown tag %.4s (%u bytes)\n", hdr.tag, (unsigned)hdr.length);
   return skipPayload(hdr.length);
 }
-
-// ═════════════════════════════════════════════════════════════════════════════
-// Button dispatch: IDLE → wake, in-session → hang up
-// ═════════════════════════════════════════════════════════════════════════════
 
 static void handleButton() {
   if (!buttonPressed()) return;
   if (!client.connected()) return;
 
   if (state == State::IDLE) {
-    if (millis() - lastSessionEnd < WAKE_COOLDOWN_MS) return;   // cooldown
+    if (millis() - lastSessionEnd < WAKE_COOLDOWN_MS) return;   
     Serial.println("[button] wake -> starting session");
     startSession(nullptr, 0);
   } else if (sessionActive) {
@@ -555,12 +537,11 @@ static void handleButton() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Connection lifecycle (mirrors _connect / _run_connection / run_forever)
+// Connection lifecycle
 // ═════════════════════════════════════════════════════════════════════════════
-
 static bool connectToServer() {
-  Serial.printf("[satellite] Connecting to %s:%d...\n", SERVER_HOST, SERVER_PORT);
-  if (!client.connect(SERVER_HOST, SERVER_PORT, 5000)) return false;
+  Serial.printf("[satellite] Reaching voice engine via %s:%d...\n", activeServerHost.c_str(), activeServerPort);
+  if (!client.connect(activeServerHost.c_str(), activeServerPort, 5000)) return false;
   client.setNoDelay(true);
 
   char helo[160];
@@ -580,20 +561,17 @@ static void runConnection() {
     handleButton();
 
     if (micStreaming && state == State::LISTENING)
-      pumpMic();                      // 32 ms per chunk, keeps loop live
+      pumpMic();                      
 
-    if (!pumpSocket()) break;         // socket died
+    if (!pumpSocket()) break;         
 
-    // Hang-up fallback: no CLOS after BYE0 (handler missing server-side?)
     if (hangingUp && millis() - hangupSentMs > HANGUP_FALLBACK_MS) {
-      Serial.println("[session] No CLOS after BYE0 - closing locally. "
-                     "(Add a BYE0 handler to the server for a clean hang-up.)");
+      Serial.println("[session] No CLOS after BYE0 - closing locally.");
       discardTTS = false;
       setState(State::CLOSING);
       endSessionToIdle();
     }
 
-    // Session watchdog — matches the Pi's 60 s queue.get timeout.
     if (sessionActive && millis() - lastEventMs > SESSION_TIMEOUT_MS) {
       Serial.println("[session] Timed out waiting for server event.");
       setState(State::CLOSING);
@@ -612,25 +590,12 @@ static void runConnection() {
   state         = State::IDLE;
 }
 
-static void ensureWifi() {
-  if (WiFi.status() == WL_CONNECTED) return;
-  Serial.printf("[wifi] Connecting to %s...\n", WIFI_SSID);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  while (WiFi.status() != WL_CONNECTED) {
-    ledShow((millis() / 300) % 2 ? CRGB::Yellow : CRGB::Black);
-    delay(50);
-  }
-  Serial.printf("[wifi] Connected, IP %s\n", WiFi.localIP().toString().c_str());
-}
-
 // ═════════════════════════════════════════════════════════════════════════════
 // Arduino entry points
 // ═════════════════════════════════════════════════════════════════════════════
-
 void setup() {
   Serial.begin(115200);
-  pinMode(PIN_BUTTON, INPUT);         // GPIO39 is input-only, board has pull-up
+  pinMode(PIN_BUTTON, INPUT);         
 
   FastLED.addLeds<SK6812, PIN_LED, GRB>(led, 1);
   FastLED.setBrightness(LED_BRIGHTNESS);
@@ -638,9 +603,8 @@ void setup() {
 
   Serial.printf("\n[satellite] Starting up (endpoint_id=\"%s\")...\n", ENDPOINT_ID);
 
-  // Startup beeps — same as the Pi client
   i2sSetMode(I2SMode::SPEAKER);
-  playSilence(0.1f);                  // wake the amp
+  playSilence(0.1f);                  
   beep(800, 0.12f, 0.3f);
   delay(80);
   beep(400, 0.12f, 0.3f);
@@ -657,7 +621,7 @@ void loop() {
     reconnectDelay = min(reconnectDelay * 2, 60000.0f);
     return;
   }
-  reconnectDelay = 2000.0f;           // reset backoff on success
+  reconnectDelay = 2000.0f;           
 
   runConnection();
 

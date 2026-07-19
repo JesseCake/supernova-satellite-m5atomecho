@@ -1,48 +1,58 @@
 #pragma once
-// ─────────────────────────────────────────────────────────────────────────────
-// Supernova Atom Echo satellite — user configuration
-// Edit this file before flashing.
-// ─────────────────────────────────────────────────────────────────────────────
+#include <Arduino.h>
 
-// ── Wi-Fi ────────────────────────────────────────────────────────────────────
-#define WIFI_SSID       "wifi-name"
-#define WIFI_PASS       "wifi-password"
-
-// ── Supernova voice server ───────────────────────────────────────────────────
-#define SERVER_HOST     "name_of_supernova_server.lan"   // same host/port as voice_server in config.yaml
-#define SERVER_PORT     10400
-
-// ── Identity (mirrors the Pi client's HELO registration) ─────────────────────
-// endpoint_id: stable identifier for this satellite, used by the server
-// registry to route CALL frames. Keep it unique per device.
+// ── Identity (Retained from your original satellite footprint) ──────────────
 #define ENDPOINT_ID     "Jesse-mobile1"
 #define FRIENDLY_NAME   "Jesse Mobile Wearable Interface"
 
-// ── Audio tuning ─────────────────────────────────────────────────────────────
-// The SPM1423 PDM mic is fairly quiet; a fixed digital gain helps ASR.
-// (The Pi client's adaptive gain was only used for wake word detection,
-// which doesn't exist here — raw-with-fixed-gain is fine for Whisper.)
+// ── Audio Tuning (Retained from your original hardware profile) ──────────────
 #define MIC_GAIN        4.0f    // 1.0 = raw. 3–6 is a sensible range.
+#define SPK_VOLUME      1.0f    // 0.0–1.0
 
-// Speaker output scale. The NS4168 distorts near full scale on the tiny
-// driver, so leave some headroom.
-#define SPK_VOLUME      1.0f   // 0.0–1.0
+// ── Interface Mechanics (Retained from your original settings) ──────────────
+#define DEBOUNCE_MS        30
+#define HANGUP_FALLBACK_MS 5000
+#define WAKE_COOLDOWN_MS   800
+#define SESSION_TIMEOUT_MS 60000   
+#define LED_BRIGHTNESS     60      
 
-// ── Button ───────────────────────────────────────────────────────────────────
-// Press while IDLE  → WAKE (the wake-word replacement)
-// Press in session  → BYE0 (hang up; server should respond with CLOS)
-#define DEBOUNCE_MS     30
+// ── Network Location Routing Types ───────────────────────────────────────────
+enum NetworkLocation {
+    LOCATION_LOCAL,  // Direct connection to local server (low latency)
+    LOCATION_REMOTE  // Needs to spin up WireGuard tunnel to reach home
+};
 
-// If the server hasn't sent CLOS this long after our BYE0 (e.g. the BYE0
-// handler isn't implemented server-side yet), force-close locally.
-#define HANGUP_FALLBACK_MS  5000
+struct WifiProfile {
+    const char* ssid;
+    const char* password;
+    NetworkLocation locationType;
+};
 
-// Cooldown after a wake press before another is accepted, mirroring the Pi's
-// wake_cooldown_s (0.8 s default). Mostly relevant across very short sessions.
-#define WAKE_COOLDOWN_MS 800
+// ── Multi-Wi-Fi Profile Registry ─────────────────────────────────────────────
+// The system scans and targets the strongest profile available automatically.
+const WifiProfile TAILORED_NETWORKS[] = {
+    {"home-wifi",       "homepassword",   LOCATION_LOCAL},
+    {"Work-WiFi-SSID",  "workpassword",   LOCATION_REMOTE}
+};
+const size_t NETWORKS_COUNT = sizeof(TAILORED_NETWORKS) / sizeof(TAILORED_NETWORKS[0]);
 
-// ── Session ──────────────────────────────────────────────────────────────────
-#define SESSION_TIMEOUT_MS  60000   // matches the Pi client's 60s event timeout
+// ── WireGuard VPN Credentials ────────────────────────────────────────────────
+// Extracted from your home DietPi deployment client profiles
+namespace WireGuardConfig {
+    const char PRIVATE_KEY[]     = "YOUR_M5ATOM_PRIVATE_KEY_HERE=";
+    const char INTERNAL_IP[]    = "10.9.0.3";                        // Unique client VPN IP
+    const char SERVER_PUB_KEY[]  = "YOUR_DIETPI_SERVER_PUBLIC_KEY=";     // Server verification key
+    const char PUBLIC_ENDPOINT[] = "yourdns.duckdns.org";            // Home public IP or DDNS
+    const int  UDP_PORT          = 51820;                            // Forwarded UDP port
+}
 
-// ── LED ──────────────────────────────────────────────────────────────────────
-#define LED_BRIGHTNESS  60      // 0–255; the SK6812 is very bright
+// ── Dynamic Server Core Connections ──────────────────────────────────────────
+namespace AgentConfig {
+    const char LOCAL_IP[]   = "IP_of_agent";  // Target address when directly at home
+    const char TUNNEL_IP[]  = "IP_of_agent";    // Target address (DietPi server IP) inside VPN tunnel
+    const int  SERVER_PORT  = 10400;
+}
+
+// ── POSIX Timezone Rule ──────────────────────────────────────────────────────
+// Configured for Melbourne/Sydney (AEST/AEDT) to automate Daylight Savings shifts.
+const char* TZ_RULE = "AEST-10AEDT,M10.1.0,M4.1.0/3";
